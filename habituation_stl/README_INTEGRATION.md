@@ -1,113 +1,100 @@
-# habituation_stl Integration Guide
+# habituation_stl Package
 
-`habituation_stl` contains the reusable STL and habituation implementation used by the production vineyard simulator. It is intentionally small and `numpy`-only so the production system can keep its existing SESTPP model, zone partitioning, robot fleet logic, task admission, and dispatch policies.
+`habituation_stl` is the self-contained STL and habituation implementation used by the production vineyard simulator. It is intentionally small and numpy-only so the production system can keep its existing SESTPP model, zone partitioning, robot fleet logic, task admission, and dispatch policies unchanged.
 
 The package replaces the predictive deterrence value when the simulator is configured with:
 
-```text
+```
 predictive_utility_mode = "stl_robustness"
 ```
+
+---
 
 ## Module Map
 
 | Module | Responsibility |
 | --- | --- |
-| `stl.py` | Quantitative STL robustness operators, temporal operators, smooth aggregators, and clause scaling. |
-| `habituation.py` | `HabituationField`, a per-cell/per-mode cue-effectiveness model with recovery and application updates. |
-| `mission_spec.py` | `SpecParams` and mission clauses for exposure, coverage, habituation, and reactive timing. |
-| `task_value.py` | Counterfactual task value `U(a,r)` from robustness improvement. |
-| `signals.py` | `RobotMonitor` for rolling STL robustness telemetry. |
-| `metrics.py` | Utility metrics for exposure, cue variety, and habituation diagnostics. |
-| `dispatch.py` | Reference reserved-capacity dispatcher used by the standalone harness. |
-| `reference_sim.py`, `experiment.py` | Standalone smoke-test simulation and B0-B4 reference ladder. |
+| `stl.py` | Quantitative STL robustness operators, temporal operators, smooth aggregators, and clause scaling |
+| `habituation.py` | `HabituationField`: per-cell/per-mode cue-effectiveness model with multiplicative decay and exponential recovery |
+| `mission_spec.py` | `SpecParams` and mission clauses for exposure (`φ_exp`), coverage (`φ_cov`), and habituation (`φ_hab`) |
+| `task_value.py` | Counterfactual task value `U(a,r)` computed from robustness improvement |
+| `signals.py` | `RobotMonitor` for rolling STL robustness telemetry during a run |
+| `metrics.py` | Utility metrics for exposure, cue variety, and habituation diagnostics |
+| `dispatch.py` | Reference reserved-capacity dispatcher used by the standalone harness |
+| `reference_sim.py` | Standalone smoke-test simulation (B0–B4 reference ladder, numpy-only) |
+| `experiment.py` | Experiment helpers for the standalone harness |
 
-## Production Integration
+---
 
-Production adapters live outside this package:
+## How It Integrates With the Production System
 
-- `DeterrentSystem.py` owns runtime habituation state, ground-truth suppression scaling, coverage service time, and final metrics.
+The package is responsible only for the STL specification and habituation state. The production adapters outside this package handle the rest:
+
+- `DeterrentSystem.py` owns runtime habituation state, ground-truth suppression scaling (truth events suppressed by `η × β_mode × kernel × decay`), coverage service time tracking, and final metrics collection.
 - `planner_task_estimation.py` converts SESTPP fields and coverage memory into `CellState` inputs for `counterfactual_value(...)`.
-- `TaskGenerator.py` scores model-scored predictive deterrence candidates and selects the best action mode.
-- `planner_task_extraction.py` preserves STL utility fields for dispatch.
-- `system_structure.py` exports STL and habituation config/metric sections.
+- `TaskGenerator.py` scores model-scored predictive deterrence candidates using the STL value and selects the best action mode.
+- `planner_task_extraction.py` preserves STL utility fields through the dispatch pipeline.
+- `system_structure.py` exports STL and habituation config and metric sections.
 
-The dispatchers do not need special STL logic. STL mode writes `predictive_stl_U` and mirrors it into `utility`, `score`, `predicted_deltaJ`, and `deltaJ_per_cost`.
+The dispatchers need no special STL logic. STL mode writes `predictive_stl_U` and mirrors it into `utility`, `score`, `predicted_deltaJ`, and `deltaJ_per_cost` so existing dispatch policies work without change.
 
-## Ground-Truth Habituation
-
-The truth path uses the same `HabituationField` concept as the planner value.
-
-Per completed deterrence event:
-
-1. resolve the cell and physical cue mode
-2. read current `eta_at_apply`
-3. append the deterrence event with that `eta`
-4. apply habituation to the field
-5. update coverage service time for the cell
-
-During truth-event filtering, suppression from a recent deterrence event is multiplied by its stored `eta`:
-
-```text
-suppression = eta_at_apply * beta_mode * spatial_kernel * temporal_decay
-```
-
-This makes repeated cue use less effective in the simulated world.
+---
 
 ## STL Task Value
 
-For candidate action `a` and robot `r`, the production planner computes:
+For candidate action `a` and robot `r`, the task value is:
 
-```text
-U(a,r) = robustness(Phi_r, trace_with_action) - robustness(Phi_r, trace_without_action)
+```
+U(a, r) = ρ(Φ_r, ξ_with_action) − ρ(Φ_r, ξ_without_action)
 ```
 
-The trace contains local-cell exposure, coverage age, and cue effectiveness. B3 and B4 differ only in the active clause set:
+where `ξ` is the predicted local signal trace and `ρ` is the smooth conjunctive STL robustness. The trace contains local-cell exposure, coverage age, and cue effectiveness.
 
-- B3: `("exp", "cov")`
-- B4: `("exp", "cov", "hab")`
+B3 and B4 differ only in their active clause set:
 
-When the habituation clause is inactive, planner-side `eta_app` is treated as `1.0`. When the clause is active, `eta_app` is read from the live habituation field.
+- B3: `("exp", "cov")` — exposure and coverage, no habituation awareness
+- B4: `("exp", "cov", "hab")` — adds the habituation clause
 
-## Tests
+When the habituation clause is inactive, the planner treats `η = 1.0` for all cues. When the clause is active, `η` is read from the live `HabituationField`.
 
-Run package-level tests from the repo root:
+---
 
-```powershell
-$env:PYTHONPATH=(Resolve-Path .\habituation_stl).Path
-C:\Users\gabri\AppData\Local\Programs\Python\Python310\python.exe habituation_stl\tests\test_spec_value.py
+## Habituation in Ground Truth
+
+The truth process uses the same `HabituationField` concept as the planner.
+
+For each completed deterrence event:
+
+1. Resolve the cell and physical cue mode.
+2. Read current effectiveness `η_at_apply` from the field.
+3. Record the deterrence event with that `η`.
+4. Apply habituation: `η ← η × (1 − κ)`, then schedule exponential recovery.
+5. Update coverage service time for the cell.
+
+During truth-event filtering, suppression from a recent deterrence event is scaled by its stored effectiveness:
+
+```
+suppression = η_at_apply × β_mode × spatial_kernel × temporal_decay
 ```
 
-Run production wiring tests:
+This makes repeated cue use less effective in the simulated world, consistent with the planner's forward model.
 
-```powershell
-$env:PYTHONPATH=(Resolve-Path .).Path
-C:\Users\gabri\AppData\Local\Programs\Python\Python310\python.exe -m unittest tests.test_ground_truth_habituation_wiring
-C:\Users\gabri\AppData\Local\Programs\Python\Python310\python.exe -m unittest tests.test_predictive_utility_calibration.PredictiveUtilityPropagationTests.test_stl_robustness_overwrites_stale_legacy_utility
+---
+
+## Running the Standalone Reference Simulation
+
+The package includes a standalone smoke-test harness that runs the B0–B4 ladder without the full production system. From the repo root:
+
+```bash
+python -m habituation_stl.reference_sim
 ```
 
-## Production Experiments
+---
 
-B0-B4 ladder:
+## Running Tests
 
-```powershell
-C:\Users\gabri\AppData\Local\Programs\Python\Python310\python.exe experiments\run_habituation_stl_production_ladder.py --outdir results\testbench\habituation_stl_b0_b4_900s_10seed_v5 --duration-s 900 --num-runs 10 --seed-start 125 --warmup-s 0 --nx 120 --ny 96 --nrobots 6 --max-workers 2
+From the repo root:
+
+```bash
+python habituation_stl/run_all_tests.py
 ```
-
-Confirmatory B1/B3/B4 batch:
-
-```powershell
-C:\Users\gabri\AppData\Local\Programs\Python\Python310\python.exe experiments\run_habituation_stl_production_ladder.py --outdir results\testbench\habituation_stl_confirm_b1_b3_b4_1800s_10seed_v5 --duration-s 1800 --num-runs 10 --seed-start 125 --warmup-s 0 --nx 120 --ny 96 --nrobots 6 --systems B1_unc_legacy B3_res_stl_nohab B4_res_stl_full --max-workers 2
-```
-
-Summarize results:
-
-```powershell
-C:\Users\gabri\AppData\Local\Programs\Python\Python310\python.exe experiments\summarize_habituation_stl_ladder.py --outdir results\testbench\habituation_stl_confirm_b1_b3_b4_1800s_10seed_v5
-```
-
-## Documentation
-
-- `docs/STL_THEORY_AND_INTEGRATION_AUDIT.md`
-- `docs/HABITUATION_STL_CONFIRMATORY_RESULTS.md`
-- `docs/habituation_stl_completion_plan.md`
-- `docs/proposal_stl.pdf`
